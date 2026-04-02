@@ -18,3 +18,8 @@ CONF_HIGH = 80
 CONF_LOW  = 30
 
 LOG_LEVEL = "INFO"
+
+# ── 任务类型，由命令行参数覆盖 ──
+# "gate"  → 仅检测道闸
+# "truck" → 仅检测重型货车
+TASK_TYPE: str = "gate"
