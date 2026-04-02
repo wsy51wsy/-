@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import dataclasses
 import json
@@ -60,19 +61,28 @@ def _sample_frames(video_path: str) -> list[tuple[int, float, bytes]]:
     return frames
 
 
-def _is_hit(result: dict) -> bool:
-    return result["道闸"] == "是" or result["重型货车"] == "是"
+def _is_hit(result: dict, task_type: str) -> bool:
+    if task_type == "gate":
+        return result.get("道闸") == "是"
+    return result.get("重型货车") == "是"
+
+
+def _get_conf(result: dict, task_type: str) -> int:
+    if task_type == "gate":
+        return result.get("道闸置信度", 0)
+    return result.get("重型货车置信度", 0)
 
 
 def _save_hit_frame(pack: str, video_path: str, frame_idx: int, time_sec: float,
-                    jpeg: bytes, raw_content: str, result: dict) -> None:
-    """将命中帧的图片和模型完整回答（含 think）保存到磁盘。"""
+                    jpeg: bytes, raw_content: str, result: dict, task_type: str) -> None:
+    """将命中帧的图片和模型完整回答保存到磁盘，路径包含任务类型（gate / truck）。"""
     video_stem = pathlib.Path(video_path).stem
-    save_dir = pathlib.Path(config.OUTPUT_DIR) / "hit_frames" / pack / video_stem
+    save_dir = pathlib.Path(config.OUTPUT_DIR) / "hit_frames" / task_type / pack / video_stem
     save_dir.mkdir(parents=True, exist_ok=True)
     base = f"frame_{frame_idx}_{time_sec}s"
     (save_dir / f"{base}.jpg").write_bytes(jpeg)
     text = (
+        f"task  : {task_type}\n"
         f"video : {video_path}\n"
         f"frame : {frame_idx}  time: {time_sec}s\n"
         f"result: {json.dumps(result, ensure_ascii=False)}\n"
@@ -83,43 +93,54 @@ def _save_hit_frame(pack: str, video_path: str, frame_idx: int, time_sec: float,
 
 
 async def process_video(ctx: InferContext, video_path: str, logger: logging.Logger,
-                        pack: str = "") -> list[dict]:
+                        pack: str = "", task_type: str = "gate") -> list[dict]:
     loop = asyncio.get_running_loop()
     frames = await loop.run_in_executor(ctx.executor, _sample_frames, video_path)
 
     hits = []
     for i, (frame_idx, time_sec, jpeg) in enumerate(frames):
-        async with ctx.sem:
-            result, raw_content = await detector.infer(ctx.session, jpeg)
+        try:
+            async with ctx.sem:
+                result, raw_content = await detector.infer(ctx.session, jpeg, task_type)
+        except Exception as e:
+            logger.warning(f"  frame {frame_idx} ({time_sec}s) skipped: {e}")
+            continue
 
         result["frame_idx"] = frame_idx
         result["time_sec"] = time_sec
 
-        logger.debug(f"  frame {frame_idx} ({time_sec}s): 道闸={result['道闸']}({result['道闸置信度']}) 货车={result['重型货车']}({result['重型货车置信度']})")
+        if task_type == "gate":
+            logger.debug(f"  frame {frame_idx} ({time_sec}s): 道闸={result.get('道闸')}({result.get('道闸置信度')})")
+        else:
+            logger.debug(f"  frame {frame_idx} ({time_sec}s): 货车={result.get('重型货车')}({result.get('重型货车置信度')})")
 
-        if _is_hit(result):
+        if _is_hit(result, task_type):
             hits.append(result)
-            _save_hit_frame(pack, video_path, frame_idx, time_sec, jpeg, raw_content, result)
+            _save_hit_frame(pack, video_path, frame_idx, time_sec, jpeg, raw_content, result, task_type)
             if config.EARLY_STOP:
-                conf = max(result["道闸置信度"] if result["道闸"] == "是" else 0,
-                           result["重型货车置信度"] if result["重型货车"] == "是" else 0)
+                conf = _get_conf(result, task_type)
                 if conf >= config.CONF_HIGH:
                     break
                 elif conf >= config.CONF_LOW:
-                    for fi, ts, jp in frames[i + 1 : i + 3]:
-                        async with ctx.sem:
-                            r2, rc2 = await detector.infer(ctx.session, jp)
+                    for fi, ts, jp in frames[i + 1: min(i + 3, len(frames))]:
+                        try:
+                            async with ctx.sem:
+                                r2, rc2 = await detector.infer(ctx.session, jp, task_type)
+                        except Exception as e:
+                            logger.warning(f"  frame {fi} ({ts}s) skipped: {e}")
+                            continue
                         r2["frame_idx"] = fi
                         r2["time_sec"] = ts
-                        if _is_hit(r2):
+                        if _is_hit(r2, task_type):
                             hits.append(r2)
-                            _save_hit_frame(pack, video_path, fi, ts, jp, rc2, r2)
+                            _save_hit_frame(pack, video_path, fi, ts, jp, rc2, r2, task_type)
                     break
 
     return hits
 
 
-async def run(tasks: list[tuple[str, str]], logger: logging.Logger) -> list[dict]:
+async def run(tasks: list[tuple[str, str]], logger: logging.Logger,
+              task_type: str) -> list[dict]:
     sem = asyncio.Semaphore(len(config.VLLM_URLS) * config.CONCURRENCY_PER_INST)
     connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -128,23 +149,19 @@ async def run(tasks: list[tuple[str, str]], logger: logging.Logger) -> list[dict
 
             async def _wrap(pack: str, fname: str, path: str) -> dict:
                 try:
-                    hits = await process_video(ctx, path, logger, pack=pack)
+                    hits = await process_video(ctx, path, logger, pack=pack, task_type=task_type)
                     return {"pack": pack, "filename": fname, "hits": hits}
                 except Exception:
                     logger.exception(f"{pack}/{fname} failed")
-                    raise
-
+                    return {"pack": pack, "filename": fname, "hits": []}
 
             futs = [_wrap(pack, os.path.basename(path), path) for pack, path in tasks]
             results = []
             for i, fut in enumerate(asyncio.as_completed(futs), 1):
-                try:
-                    item = await fut
-                    results.append(item)
-                    status = f"HIT({len(item['hits'])})" if item["hits"] else "miss"
-                    logger.info(f"[{i}/{len(tasks)}] {item['pack']}/{item['filename']} -> {status}")
-                except Exception:
-                    logger.exception(f"[{i}/{len(tasks)}] task failed")
+                item = await fut
+                results.append(item)
+                status = f"HIT({len(item['hits'])})" if item["hits"] else "miss"
+                logger.info(f"[{i}/{len(tasks)}] {item['pack']}/{item['filename']} -> {status}")
     return results
 
 
@@ -162,12 +179,25 @@ def build_output(results: list[dict]) -> tuple[dict, dict]:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="视频道闸/重型货车筛选")
+    parser.add_argument(
+        "--task",
+        choices=["gate", "truck"],
+        default="gate",
+        help="检测任务类型：gate=道闸，truck=重型货车（默认：gate）",
+    )
+    args = parser.parse_args()
+    config.TASK_TYPE = args.task
+    task_type = args.task
+
     logger = setup_logger()
+    logger.info(f"Task type: {task_type} ({'道闸' if task_type == 'gate' else '重型货车'})")
+
     tasks = scan_videos(PACK_NAMES)
     logger.info(f"Total videos: {len(tasks)}")
 
     t0 = time.time()
-    results = asyncio.run(run(tasks, logger))
+    results = asyncio.run(run(tasks, logger, task_type))
     elapsed = time.time() - t0
 
     simple, detail = build_output(results)
@@ -175,9 +205,9 @@ def main():
         simple.setdefault(pack, [])
 
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    with open(os.path.join(config.OUTPUT_DIR, "results.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(config.OUTPUT_DIR, f"results_{task_type}.json"), "w", encoding="utf-8") as f:
         json.dump(simple, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(config.OUTPUT_DIR, "results_detail.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(config.OUTPUT_DIR, f"results_{task_type}_detail.json"), "w", encoding="utf-8") as f:
         json.dump(detail, f, ensure_ascii=False, indent=2)
 
     total_hits = sum(len(v) for v in simple.values())
